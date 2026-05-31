@@ -250,7 +250,7 @@ function AdminDashboard() {
 }
 
 function SessionManager() {
-  const empty = { title: '', description: '', speakerName: '', startTime: '', endTime: '', location: '', sortOrder: 1 };
+  const empty = { title: '', description: '', speakerName: '', startTime: '', endTime: '', location: '', status: 'open', sortOrder: 1 };
   const [sessions, setSessions] = useState([]);
   const [form, setForm] = useState(empty);
   const [editingId, setEditingId] = useState(null);
@@ -284,8 +284,18 @@ function SessionManager() {
       startTime: session.startTime,
       endTime: session.endTime,
       location: session.location || '',
+      status: session.status || 'open',
       sortOrder: session.sortOrder,
     });
+  }
+
+  async function toggleStatus(session) {
+    const nextStatus = session.status === 'open' ? 'closed' : 'open';
+    await apiRequest(`/admin/sessions/${session.id}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: nextStatus }),
+    });
+    load();
   }
 
   async function remove(id) {
@@ -303,6 +313,13 @@ function SessionManager() {
         <TextInput label="End time" value={form.endTime} onChange={(endTime) => setForm({ ...form, endTime })} />
         <TextInput label="Location" value={form.location} onChange={(location) => setForm({ ...form, location })} />
         <TextInput label="Description" value={form.description} onChange={(description) => setForm({ ...form, description })} />
+        <label className="field">
+          <span>Status</span>
+          <select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}>
+            <option value="open">Open</option>
+            <option value="closed">Closed</option>
+          </select>
+        </label>
         <button className="primary-button">{editingId ? 'Update session' : 'Add session'}</button>
         {editingId && <button type="button" className="ghost-button" onClick={() => { setEditingId(null); setForm(empty); }}>Cancel</button>}
       </form>
@@ -311,11 +328,17 @@ function SessionManager() {
         {sessions.map((session) => (
           <article className="row-card" key={session.id}>
             <div>
-              <strong>{session.startTime} - {session.endTime}</strong>
+              <div className="status-row">
+                <strong>{session.startTime} - {session.endTime}</strong>
+                <span className={`pill ${session.status || 'open'}`}>{session.status || 'open'}</span>
+              </div>
               <h3>{session.title}</h3>
               <p>{session.speakerName || 'No speaker'} {session.location ? `- ${session.location}` : ''}</p>
             </div>
             <div className="actions">
+              <button className="ghost-button" onClick={() => toggleStatus(session)}>
+                {session.status === 'closed' ? 'Open' : 'Close'}
+              </button>
               <button className="ghost-button" onClick={() => edit(session)}>Edit</button>
               <button className="danger-button" onClick={() => remove(session.id)}>Delete</button>
             </div>
@@ -416,10 +439,40 @@ function CertificateManager() {
 function AttendeeApp() {
   const [profile, setProfile] = useState(null);
   const [sessions, setSessions] = useState([]);
+  const [selectedSessionId, setSelectedSessionId] = useState(null);
+  const [attendanceError, setAttendanceError] = useState('');
+  const [recordingSessionId, setRecordingSessionId] = useState(null);
+
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) || sessions[0];
+
+  async function loadAttendeeData() {
+    const [nextProfile, sessionData] = await Promise.all([
+      apiRequest('/attendee/me'),
+      apiRequest('/sessions'),
+    ]);
+    setProfile(nextProfile);
+    setSessions(sessionData.sessions);
+    if (!selectedSessionId && sessionData.sessions[0]) setSelectedSessionId(sessionData.sessions[0].id);
+  }
+
   useEffect(() => {
-    apiRequest('/attendee/me').then(setProfile);
-    apiRequest('/sessions').then((data) => setSessions(data.sessions));
+    loadAttendeeData();
   }, []);
+
+  async function recordSessionAttendance(session) {
+    setAttendanceError('');
+    setRecordingSessionId(session.id);
+    try {
+      await apiRequest(`/sessions/${session.id}/attendance`, { method: 'POST', body: JSON.stringify({}) });
+      await loadAttendeeData();
+      setSelectedSessionId(session.id);
+    } catch (err) {
+      setAttendanceError(err.message);
+    } finally {
+      setRecordingSessionId(null);
+    }
+  }
+
   if (!profile) return <StatusCard title="Loading" text="Preparing your workshop dashboard..." />;
   return (
     <div className="attendee-grid">
@@ -439,14 +492,49 @@ function AttendeeApp() {
         <SectionHeader title="Schedule" subtitle="Today’s single-track program." />
         <div className="timeline">
           {sessions.map((session) => (
-            <article key={session.id}>
+            <button
+              className={`session-tile ${session.status || 'open'} ${selectedSession?.id === session.id ? 'active' : ''}`}
+              key={session.id}
+              onClick={() => {
+                setSelectedSessionId(session.id);
+                setAttendanceError('');
+              }}
+              type="button"
+            >
               <time>{session.startTime} - {session.endTime}</time>
               <h3>{session.title}</h3>
               <p>{session.speakerName || 'Workshop Team'}</p>
-            </article>
+              <div className="status-row">
+                <span className={`pill ${session.status || 'open'}`}>{session.status || 'open'}</span>
+                {session.attended && <span className="pill attended">attended</span>}
+              </div>
+            </button>
           ))}
         </div>
       </section>
+      {selectedSession && (
+        <section className="panel session-detail">
+          <SectionHeader title={selectedSession.title} subtitle={`${selectedSession.startTime} - ${selectedSession.endTime}`} />
+          <div className="detail-grid">
+            <Metric icon={CalendarDays} label="Status" value={selectedSession.status || 'open'} />
+            <Metric icon={Users} label="Speaker" value={selectedSession.speakerName || 'Workshop Team'} />
+            <Metric icon={Ticket} label="Location" value={selectedSession.location || 'Main Hall'} />
+          </div>
+          <p className="detail-copy">{selectedSession.description || 'Session details will appear here.'}</p>
+          {selectedSession.attended && selectedSession.attendedAt && (
+            <div className="success-note">Attendance recorded at {new Date(selectedSession.attendedAt).toLocaleString()}</div>
+          )}
+          {attendanceError && <div className="error">{attendanceError}</div>}
+          <button
+            className="primary-button"
+            disabled={selectedSession.status !== 'open' || selectedSession.attended || recordingSessionId === selectedSession.id}
+            onClick={() => recordSessionAttendance(selectedSession)}
+          >
+            <ClipboardCheck size={18} />
+            {selectedSession.attended ? 'Attendance recorded' : 'Record attendance'}
+          </button>
+        </section>
+      )}
     </div>
   );
 }

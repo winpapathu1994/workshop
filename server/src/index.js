@@ -64,6 +64,19 @@ function isEligible(userId) {
   return row?.registrationStatus === 'registered' && row?.attendanceStatus === 'attended';
 }
 
+function requireRegisteredAttendee(req, res) {
+  if (req.user.role !== 'attendee') {
+    res.status(403).json({ error: { message: 'Only attendees can record attendance.' } });
+    return false;
+  }
+  const registration = db.prepare("SELECT id FROM registrations WHERE user_id = ? AND status = 'registered'").get(req.user.id);
+  if (!registration) {
+    res.status(403).json({ error: { message: 'You are not registered for this workshop.' } });
+    return false;
+  }
+  return true;
+}
+
 function certificateNumber(userId) {
   return `WS-20260528-${String(userId).padStart(5, '0')}`;
 }
@@ -152,10 +165,80 @@ app.get('/api/auth/me', auth, (req, res) => res.json({ user: req.user }));
 app.get('/api/sessions', auth, (req, res) => {
   const sessions = db.prepare(`
     SELECT id, title, description, speaker_name AS speakerName, start_time AS startTime,
-           end_time AS endTime, location, sort_order AS sortOrder
+           end_time AS endTime, location, status, sort_order AS sortOrder
     FROM sessions ORDER BY sort_order, start_time
-  `).all();
+  `).all().map((session) => {
+    if (req.user.role !== 'attendee') return session;
+    const attendance = db.prepare(`
+      SELECT status, marked_at AS markedAt
+      FROM session_attendance_records
+      WHERE session_id = ? AND user_id = ?
+    `).get(session.id, req.user.id);
+    return {
+      ...session,
+      attended: attendance?.status === 'attended',
+      attendedAt: attendance?.status === 'attended' ? attendance.markedAt : null,
+    };
+  });
   res.json({ sessions });
+});
+
+app.get('/api/sessions/:id', auth, (req, res) => {
+  const session = db.prepare(`
+    SELECT id, title, description, speaker_name AS speakerName, start_time AS startTime,
+           end_time AS endTime, location, status, sort_order AS sortOrder
+    FROM sessions WHERE id = ?
+  `).get(req.params.id);
+  if (!session) return res.status(404).json({ error: { message: 'Session not found.' } });
+
+  if (req.user.role === 'attendee') {
+    const attendance = db.prepare(`
+      SELECT status, marked_at AS markedAt
+      FROM session_attendance_records
+      WHERE session_id = ? AND user_id = ?
+    `).get(session.id, req.user.id);
+    session.attended = attendance?.status === 'attended';
+    session.attendedAt = attendance?.status === 'attended' ? attendance.markedAt : null;
+  }
+
+  res.json({ session });
+});
+
+app.post('/api/sessions/:id/attendance', auth, (req, res) => {
+  if (!requireRegisteredAttendee(req, res)) return;
+
+  const session = db.prepare('SELECT id, status FROM sessions WHERE id = ?').get(req.params.id);
+  if (!session) return res.status(404).json({ error: { message: 'Session not found.' } });
+  if (session.status !== 'open') {
+    return res.status(403).json({ error: { message: 'This session is closed for attendance.' } });
+  }
+
+  const existing = db.prepare(`
+    SELECT status, marked_at AS markedAt
+    FROM session_attendance_records
+    WHERE session_id = ? AND user_id = ? AND status = 'attended'
+  `).get(session.id, req.user.id);
+  if (existing) {
+    return res.json({ status: 'attended', markedAt: existing.markedAt, alreadyAttended: true });
+  }
+
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO session_attendance_records (session_id, user_id, status, method, marked_at)
+      VALUES (?, ?, 'attended', 'session_self', ?)
+      ON CONFLICT(session_id, user_id) DO UPDATE SET status = 'attended', method = 'session_self', marked_at = excluded.marked_at, updated_at = CURRENT_TIMESTAMP
+    `).run(session.id, req.user.id, now);
+
+    db.prepare(`
+      INSERT INTO attendance_records (user_id, status, method, marked_at)
+      VALUES (?, 'attended', 'session_self', ?)
+      ON CONFLICT(user_id) DO UPDATE SET status = 'attended', method = 'session_self', marked_at = excluded.marked_at, updated_at = CURRENT_TIMESTAMP
+    `).run(req.user.id, now);
+  });
+  tx();
+
+  res.json({ status: 'attended', markedAt: now });
 });
 
 app.get('/api/attendee/me', auth, (req, res) => {
@@ -181,24 +264,34 @@ app.get('/api/admin/dashboard', auth, requireAdmin, (req, res) => {
 });
 
 app.post('/api/admin/sessions', auth, requireAdmin, (req, res) => {
-  const { title, description, speakerName, startTime, endTime, location } = req.body;
+  const { title, description, speakerName, startTime, endTime, location, status } = req.body;
   if (!title || !startTime || !endTime) return res.status(400).json({ error: { message: 'Title, start time, and end time are required.' } });
   const sortOrder = db.prepare('SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM sessions').get().next;
   const result = db.prepare(`
-    INSERT INTO sessions (title, description, speaker_name, start_time, end_time, location, sort_order)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(title, description || '', speakerName || '', startTime, endTime, location || '', sortOrder);
+    INSERT INTO sessions (title, description, speaker_name, start_time, end_time, location, status, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(title, description || '', speakerName || '', startTime, endTime, location || '', status === 'closed' ? 'closed' : 'open', sortOrder);
   res.status(201).json({ id: result.lastInsertRowid });
 });
 
 app.put('/api/admin/sessions/:id', auth, requireAdmin, (req, res) => {
-  const { title, description, speakerName, startTime, endTime, location, sortOrder } = req.body;
+  const { title, description, speakerName, startTime, endTime, location, sortOrder, status } = req.body;
   db.prepare(`
     UPDATE sessions
-    SET title = ?, description = ?, speaker_name = ?, start_time = ?, end_time = ?, location = ?, sort_order = ?, updated_at = CURRENT_TIMESTAMP
+    SET title = ?, description = ?, speaker_name = ?, start_time = ?, end_time = ?, location = ?, status = ?, sort_order = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
-  `).run(title, description || '', speakerName || '', startTime, endTime, location || '', Number(sortOrder) || 0, req.params.id);
+  `).run(title, description || '', speakerName || '', startTime, endTime, location || '', status === 'closed' ? 'closed' : 'open', Number(sortOrder) || 0, req.params.id);
   res.json({ ok: true });
+});
+
+app.patch('/api/admin/sessions/:id/status', auth, requireAdmin, (req, res) => {
+  const nextStatus = req.body.status === 'closed' ? 'closed' : 'open';
+  db.prepare(`
+    UPDATE sessions
+    SET status = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(nextStatus, req.params.id);
+  res.json({ ok: true, status: nextStatus });
 });
 
 app.delete('/api/admin/sessions/:id', auth, requireAdmin, (req, res) => {

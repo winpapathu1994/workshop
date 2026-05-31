@@ -48,6 +48,7 @@ export function migrate() {
       start_time TEXT NOT NULL,
       end_time TEXT NOT NULL,
       location TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
       sort_order INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -79,6 +80,20 @@ export function migrate() {
       FOREIGN KEY(qr_token_id) REFERENCES attendance_qr_tokens(id)
     );
 
+    CREATE TABLE IF NOT EXISTS session_attendance_records (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('attended', 'revoked')),
+      method TEXT NOT NULL,
+      marked_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_id, user_id),
+      FOREIGN KEY(session_id) REFERENCES sessions(id),
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
     CREATE TABLE IF NOT EXISTS certificates (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL UNIQUE,
@@ -90,4 +105,9 @@ export function migrate() {
       FOREIGN KEY(user_id) REFERENCES users(id)
     );
   `);
+
+  const sessionColumns = db.prepare(`PRAGMA table_info(sessions)`).all().map((column) => column.name);
+  if (!sessionColumns.includes('status')) {
+    db.prepare(`ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'open'`).run();
+  }
 }
